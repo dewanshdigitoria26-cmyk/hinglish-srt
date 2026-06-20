@@ -1,13 +1,8 @@
-import gradio as gr
+import streamlit as st
 import subprocess, os, uuid, re
 from faster_whisper import WhisperModel
 
 os.makedirs("outputs", exist_ok=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DEVANAGARI → HINGLISH CONVERTER
-# ─────────────────────────────────────────────────────────────────────────────
 
 CONSONANT_MAP = {
     'क': 'k',  'ख': 'kh', 'ग': 'g',  'घ': 'gh', 'ङ': 'ng',
@@ -97,42 +92,36 @@ WORD_MAP = {
     'teem': 'team',    'mobail': 'mobile',
 }
 
-HALANT       = '्'
-ANUSVARA     = 'ं'
-CHANDRABINDU = 'ँ'
-NUKTA        = '़'
-LONG_A_MATRA = 'ा'
+HALANT       = '\u094d'
+ANUSVARA     = '\u0902'
+CHANDRABINDU = '\u0901'
+NUKTA        = '\u093c'
+LONG_A_MATRA = '\u093e'
 
 
 def parse_devanagari_word(word):
     if word in SPECIAL_CASES:
         return SPECIAL_CASES[word]
-
     for deva, rom in SPECIAL_CASES.items():
         if len(deva) > 1:
             word = word.replace(deva, '\x00' + rom + '\x00')
-
     chars = list(word)
-    n     = len(chars)
-    syls  = []
-    i     = 0
-
+    n = len(chars)
+    syls = []
+    i = 0
     while i < n:
         ch = chars[i]
-
         if ch == '\x00':
             j = i + 1; buf = ''
             while j < n and chars[j] != '\x00':
                 buf += chars[j]; j += 1
             syls.append(('C_pure', buf))
             i = j + 1; continue
-
         if ch in VOWEL_MAP:
             v = VOWEL_MAP[ch]
             if i + 1 < n and chars[i + 1] in (ANUSVARA, CHANDRABINDU):
                 v += 'n'; i += 1
             syls.append(('V', v)); i += 1; continue
-
         if ch in CONSONANT_MAP or (
             i + 1 < n and chars[i + 1] == NUKTA and ch + NUKTA in CONSONANT_MAP
         ):
@@ -140,10 +129,8 @@ def parse_devanagari_word(word):
                 rc = CONSONANT_MAP[ch + NUKTA]; i += 2
             else:
                 rc = CONSONANT_MAP.get(ch, ch); i += 1
-
             if i < n and chars[i] == HALANT:
                 syls.append(('C_pure', rc)); i += 1; continue
-
             if i < n and chars[i] in MATRA_MAP:
                 mc = chars[i]; mv = MATRA_MAP[mc]; i += 1
                 is_long_a = (mc == LONG_A_MATRA)
@@ -156,21 +143,16 @@ def parse_devanagari_word(word):
                 else:
                     syls.append(('Ca', rc))
             continue
-
         if ch in (ANUSVARA, CHANDRABINDU):
             syls.append(('V', 'n')); i += 1; continue
-
-        if ch == 'ः': i += 1; continue
-
+        if ch == '\u0903': i += 1; continue
         syls.append(('X', ch)); i += 1
 
     total = len(syls)
-    out   = []
-
+    out = []
     for idx, syl in enumerate(syls):
         is_last = (idx == total - 1)
-        stype   = syl[0]
-
+        stype = syl[0]
         if stype == 'Ca':
             rc = syl[1]
             if is_last:
@@ -179,20 +161,16 @@ def parse_devanagari_word(word):
                 out.append(rc)
             else:
                 out.append(rc + 'a')
-
         elif stype == 'CV':
             rc, mv = syl[1], syl[2]
             is_long_a = syl[3] if len(syl) > 3 else False
             if is_last and is_long_a:
                 mv = 'a'
             out.append(rc + mv)
-
         elif stype == 'C_pure':
             out.append(syl[1])
-
         else:
             out.append(syl[1])
-
     return ''.join(out)
 
 
@@ -202,32 +180,24 @@ def is_devanagari(text):
 
 def devanagari_to_hinglish(text):
     tokens = re.split(r'([\u0900-\u097F]+)', text)
-    out    = []
-
+    out = []
     for tok in tokens:
         if not tok:
             continue
         if not is_devanagari(tok):
             out.append(tok)
             continue
-
-        deva_words  = tok.split()
+        deva_words = tok.split()
         roman_words = []
         for dw in deva_words:
             roman = parse_devanagari_word(dw)
-            rl    = roman.lower()
+            rl = roman.lower()
             if rl in WORD_MAP:
                 roman = WORD_MAP[rl]
             roman_words.append(roman)
-
         out.append(' '.join(roman_words))
-
     return re.sub(r' {2,}', ' ', ''.join(out)).strip()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
 
 def fmt(s):
     h   = int(s // 3600)
@@ -236,260 +206,177 @@ def fmt(s):
     return f"{h:02}:{m:02}:{sec:06.3f}".replace(".", ",")
 
 
-_model      = None
-_model_size = None
-
-
+@st.cache_resource
 def get_model(size="medium"):
-    global _model, _model_size
-    if _model is None or _model_size != size:
-        _model = WhisperModel(
-            size,
-            device="cpu",
-            compute_type="int8",
-            num_workers=2,
-            cpu_threads=4,
-        )
-        _model_size = size
-    return _model
+    return WhisperModel(size, device="cpu", compute_type="int8", num_workers=2, cpu_threads=4)
 
 
-# ─── Main Transcription Function ─────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
-def transcribe_audio(audio_path, words_per_line, model_size, progress=gr.Progress()):
-    if audio_path is None:
-        return None, "❌ Pehle audio/video file upload karo!"
+st.set_page_config(page_title="HinglishSRT", page_icon="🎙️", layout="centered")
 
-    try:
-        job_id         = str(uuid.uuid4())
-        wav_path       = f"outputs/{job_id}.wav"
-        out_path       = f"outputs/{job_id}.srt"
-        words_per_line = int(words_per_line)
+st.markdown("""
+<style>
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { max-width: 760px; padding-top: 2rem; }
+.stButton > button {
+    background: linear-gradient(90deg,#ff6b35,#ffb347) !important;
+    color: white !important; font-weight: 700 !important;
+    border: none !important; border-radius: 10px !important;
+    font-size: 1rem !important; width: 100% !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-        progress(0.05, desc="Audio convert ho raha hai...")
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path,
-             "-ar", "16000", "-ac", "1",
-             "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
-             wav_path],
-            capture_output=True
-        )
-        if r.returncode != 0:
-            return None, f"❌ FFmpeg error: {r.stderr.decode()}"
+st.markdown("""
+<div style="text-align:center;padding:1.5rem 0 1rem">
+  <div style="font-size:2rem;font-weight:900;background:linear-gradient(90deg,#ff6b35,#ffb347);
+       -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+    🎙️ HinglishSRT
+  </div>
+  <div style="color:#888;font-size:.9rem;margin-top:4px">
+    Hindi Audio → WhatsApp Hinglish Subtitles &nbsp;•&nbsp; 100% Free &nbsp;•&nbsp; No API Key
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-        progress(0.15, desc=f"Whisper {model_size} model load ho raha hai...")
-        model = get_model(model_size)
+c1, c2, c3 = st.columns(3)
+c1.info("📁 **Koi bhi File**\nMP3 MP4 WAV OGG M4A WEBM FLAC MKV")
+c2.info("🆓 **100% Free**\nNo API key • No cost")
+c3.info("💬 **WhatsApp Style**\nNatural Roman Hinglish")
 
-        progress(0.3, desc="Transcribe ho rahi hai... thoda time lagega")
-        segments_gen, info = model.transcribe(
-            wav_path,
-            task="transcribe",
-            language="hi",
-            beam_size=5,
-            best_of=5,
-            temperature=[0.0, 0.2, 0.4],
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=400,
-            ),
-            word_timestamps=False,
-            chunk_length=30,
-            initial_prompt=(
-                "यह एक हिंदी बातचीत है जिसमें कुछ अंग्रेज़ी शब्द जैसे payment, "
-                "account, business, online, team भी आते हैं।"
-            ),
-        )
+st.divider()
 
-        progress(0.5, desc="Segments collect ho rahe hain...")
-        raw_segments = []
-        seg_id = 1
-        for seg in segments_gen:
-            raw = seg.text.strip()
-            if not raw:
-                continue
-            raw_segments.append({
-                "id":       seg_id,
-                "start":    seg.start,
-                "end":      seg.end,
-                "raw_text": raw,
-            })
-            seg_id += 1
+uploaded_file = st.file_uploader(
+    "🎵 Audio / Video Upload Karo",
+    type=["mp3","mp4","wav","ogg","m4a","webm","flac","mkv","aac","wma","mov","avi"]
+)
 
-        if not raw_segments:
-            return None, "❌ Koi speech detect nahi hui. Audio check karo ya volume badhao."
+ca, cb = st.columns(2)
+with ca:
+    model_size = st.selectbox("🤖 Whisper Model", ["medium","small"], index=0,
+                              help="medium = best accuracy")
+with cb:
+    words_per_line = st.slider("📝 Words per subtitle line", 1, 12, 6)
 
-        progress(0.6, desc="Hinglish conversion ho rahi hai...")
-        total = len(raw_segments)
-        for i, seg in enumerate(raw_segments):
-            if is_devanagari(seg["raw_text"]):
-                seg["hinglish_text"] = devanagari_to_hinglish(seg["raw_text"])
-            else:
-                seg["hinglish_text"] = seg["raw_text"]
+run_btn = st.button("🎯 Hinglish Subtitles Banao")
 
-            if i % 10 == 0:
-                frac = 0.6 + 0.3 * (i / max(total, 1))
-                progress(frac, desc=f"Converting... ({i}/{total})")
+if run_btn:
+    if uploaded_file is None:
+        st.error("❌ Pehle audio/video file upload karo!")
+    else:
+        job_id   = str(uuid.uuid4())
+        ext      = os.path.splitext(uploaded_file.name)[1]
+        inp_path = f"outputs/{job_id}_input{ext}"
+        wav_path = f"outputs/{job_id}.wav"
+        out_path = f"outputs/{job_id}.srt"
 
-        progress(0.92, desc="SRT ban rahi hai...")
-        parts = []
-        n     = 1
-        for seg in raw_segments:
-            t1, t2 = seg["start"], seg["end"]
-            text   = seg["hinglish_text"].strip()
-            if not text:
-                continue
+        with open(inp_path, "wb") as f:
+            f.write(uploaded_file.read())
 
-            words = text.split()
-            if not words:
-                continue
-
-            groups = [
-                words[i:i + words_per_line]
-                for i in range(0, len(words), words_per_line)
-            ]
-            tpg = (t2 - t1) / max(len(groups), 1)
-
-            for j, g in enumerate(groups):
-                gs   = t1 + j * tpg
-                ge   = gs + tpg
-                line = ' '.join(g)
-                parts.append(f"{n}\n{fmt(gs)} --> {fmt(ge)}\n{line}\n\n")
-                n += 1
-
-        if n == 1:
-            return None, "❌ Conversion ke baad koi valid text nahi mila."
-
-        srt = ''.join(parts)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(srt)
+        status   = st.empty()
+        progress = st.progress(0)
 
         try:
-            os.remove(wav_path)
-        except Exception:
-            pass
+            status.info("⏳ Audio convert ho raha hai...")
+            progress.progress(5)
+            r = subprocess.run(
+                ["ffmpeg","-y","-i",inp_path,"-ar","16000","-ac","1",
+                 "-af","loudnorm=I=-16:LRA=11:TP=-1.5", wav_path],
+                capture_output=True
+            )
+            if r.returncode != 0:
+                st.error(f"❌ FFmpeg error: {r.stderr.decode()}"); st.stop()
 
-        progress(1.0, desc="Ho gaya!")
-        return out_path, (
-            f"✅ Ho gaya! {n-1} subtitle lines ready!\n"
-            f"📊 {len(raw_segments)} segments processed\n"
-            f"🎯 Model: Whisper {model_size} + Custom Hinglish Parser"
-        )
+            status.info(f"⏳ Whisper {model_size} load ho raha hai...")
+            progress.progress(15)
+            model = get_model(model_size)
 
-    except Exception as e:
-        import traceback
-        return None, f"❌ Error:\n{str(e)}\n\n{traceback.format_exc()}"
+            status.info("⏳ Transcribe ho rahi hai... thoda time lagega")
+            progress.progress(30)
+            segments_gen, _ = model.transcribe(
+                wav_path, task="transcribe", language="hi",
+                beam_size=5, best_of=5, temperature=[0.0,0.2,0.4],
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.4, vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400),
+                word_timestamps=False, chunk_length=30,
+                initial_prompt=(
+                    "\u092f\u0939 \u090f\u0915 \u0939\u093f\u0902\u0926\u0940 "
+                    "\u092c\u093e\u0924\u091a\u0940\u0924 \u0939\u0948\u0964"
+                ),
+            )
 
+            status.info("⏳ Segments collect ho rahe hain...")
+            progress.progress(50)
+            raw_segments = []
+            for seg in segments_gen:
+                raw = seg.text.strip()
+                if raw:
+                    raw_segments.append({"start":seg.start,"end":seg.end,"raw_text":raw})
 
-# ─── Gradio UI ────────────────────────────────────────────────────────────────
+            if not raw_segments:
+                st.error("❌ Koi speech detect nahi hui."); st.stop()
 
-css = """
-footer { display: none !important; }
-.gradio-container { max-width: 760px !important; margin: 0 auto !important; }
-"""
+            status.info("⏳ Hinglish conversion ho rahi hai...")
+            total = len(raw_segments)
+            for i, seg in enumerate(raw_segments):
+                seg["hinglish_text"] = (
+                    devanagari_to_hinglish(seg["raw_text"])
+                    if is_devanagari(seg["raw_text"]) else seg["raw_text"]
+                )
+                if i % 10 == 0:
+                    progress.progress(int(60 + 30 * (i / max(total, 1))))
 
-with gr.Blocks(title="HinglishSRT", css=css) as demo:
+            progress.progress(92)
+            parts = []; n = 1
+            for seg in raw_segments:
+                t1, t2 = seg["start"], seg["end"]
+                words  = seg["hinglish_text"].strip().split()
+                if not words: continue
+                groups = [words[i:i+words_per_line] for i in range(0,len(words),words_per_line)]
+                tpg    = (t2-t1) / max(len(groups),1)
+                for j, g in enumerate(groups):
+                    gs = t1+j*tpg; ge = gs+tpg
+                    parts.append(f"{n}\n{fmt(gs)} --> {fmt(ge)}\n{' '.join(g)}\n\n")
+                    n += 1
 
-    gr.HTML("""
-    <div style="text-align:center;padding:32px 0 20px">
-      <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:16px">
-        <div style="width:44px;height:44px;background:linear-gradient(135deg,#ff6b35,#ffb347);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:24px">🎙</div>
-        <span style="font-size:20px;font-weight:900;color:#e8eaf0">Hinglish<span style="color:#ff6b35">SRT</span></span>
-      </div>
-      <div style="font-size:1.9rem;font-weight:900;background:linear-gradient(90deg,#ff6b35,#ffb347);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px">
-        Hindi Audio → WhatsApp Hinglish Subtitles
-      </div>
-      <div style="color:#5a6280;font-size:.95rem">
-        100% Free • No API Key • Local Processing
-      </div>
-    </div>
-    """)
+            if n == 1:
+                st.error("❌ Koi valid text nahi mila."); st.stop()
 
-    gr.HTML("""
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px">
-      <div style="background:#0d1117;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;text-align:center">
-        <div style="font-size:1.5rem;margin-bottom:6px">📁</div>
-        <div style="font-weight:700;font-size:.82rem;color:#e8eaf0;margin-bottom:3px">Koi bhi File</div>
-        <div style="color:#5a6280;font-size:.7rem">MP3 MP4 WAV OGG M4A WEBM FLAC MKV</div>
-      </div>
-      <div style="background:#0d1117;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;text-align:center">
-        <div style="font-size:1.5rem;margin-bottom:6px">🆓</div>
-        <div style="font-weight:700;font-size:.82rem;color:#e8eaf0;margin-bottom:3px">100% Free</div>
-        <div style="color:#5a6280;font-size:.7rem">No API key • No cost • Local only</div>
-      </div>
-      <div style="background:#0d1117;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;text-align:center">
-        <div style="font-size:1.5rem;margin-bottom:6px">💬</div>
-        <div style="font-weight:700;font-size:.82rem;color:#e8eaf0;margin-bottom:3px">WhatsApp Style</div>
-        <div style="color:#5a6280;font-size:.7rem">Natural Roman Hinglish output</div>
-      </div>
-    </div>
-    """)
+            srt_content = ''.join(parts)
+            progress.progress(100)
+            status.success(
+                f"✅ Ho gaya! {n-1} subtitle lines ready!  \n"
+                f"📊 {len(raw_segments)} segments • 🎯 Whisper {model_size}"
+            )
+            st.download_button(
+                "⬇️ SRT File Download Karo",
+                data=srt_content,
+                file_name=f"{os.path.splitext(uploaded_file.name)[0]}_hinglish.srt",
+                mime="text/plain",
+            )
 
-    file_input = gr.File(
-        label="🎵 Audio / Video Upload Karo",
-        file_types=[".mp3", ".mp4", ".wav", ".ogg", ".m4a", ".webm",
-                    ".flac", ".mkv", ".aac", ".wma", ".mov", ".avi"],
-        type="filepath"
-    )
+        except Exception as e:
+            import traceback
+            st.error(f"❌ Error:\n{str(e)}\n\n{traceback.format_exc()}")
+        finally:
+            for p in [inp_path, wav_path]:
+                try: os.remove(p)
+                except: pass
 
-    with gr.Row():
-        model_dropdown = gr.Dropdown(
-            choices=["small", "medium"],
-            value="medium",
-            label="🤖 Whisper Model (medium = best accuracy)",
-        )
-        words_slider = gr.Slider(
-            minimum=1, maximum=12, value=6, step=1,
-            label="📝 Words per subtitle line"
-        )
-
-    submit_btn = gr.Button("🎯 Hinglish Subtitles Banao", variant="primary", size="lg")
-
-    status_box = gr.Textbox(
-        label="Status",
-        interactive=False,
-        placeholder="File upload karo aur button dabao..."
-    )
-
-    output_file = gr.File(label="⬇️ SRT File Download Karo")
-
-    submit_btn.click(
-        fn=transcribe_audio,
-        inputs=[file_input, words_slider, model_dropdown],
-        outputs=[output_file, status_box],
-    )
-
-    gr.HTML("""
-    <div style="background:#0d1117;border:1px solid rgba(255,107,53,0.2);border-radius:14px;padding:18px;margin-top:8px">
-      <div style="font-weight:700;color:#ff6b35;margin-bottom:10px;font-size:.85rem">💡 Tips:</div>
-      <div style="color:#7a849a;font-size:.75rem;line-height:2">
-        ✅ <b style="color:#e8eaf0">Koi API key nahi chahiye</b> — bilkul free hai!<br>
-        ✅ <b style="color:#e8eaf0">Clear audio</b> use karo — background noise se accuracy kam hoti hai<br>
-        ✅ <b style="color:#e8eaf0">medium model</b> recommend hai — small se ~30% better accuracy milti hai<br>
-        ⚠️ Medium model pehli baar ~1.4GB download karega — internet chahiye<br>
-        ⚠️ Custom syllable parser hai — bahut accurate, lekin rare words mein thoda adjust kar lena
-      </div>
-    </div>
-    """)
-
-    gr.HTML("""
-    <div style="text-align:center;padding:20px 0 8px;color:#3a4260;font-size:.72rem">
-        Powered by Whisper + Custom Hinglish Parser • 100% Free • No API Required
-    </div>
-    """)
-
-demo.queue()
-demo.launch(
-    server_name="0.0.0.0",
-    server_port=7860,
-    ssr_mode=False,
-    theme=gr.themes.Base(
-        primary_hue=gr.themes.colors.orange,
-        neutral_hue=gr.themes.colors.slate,
-        font=gr.themes.GoogleFont("DM Sans"),
-    ),
-)
+st.divider()
+st.markdown("""
+<div style="background:#0d1117;border:1px solid rgba(255,107,53,0.2);
+     border-radius:12px;padding:14px;font-size:.78rem;color:#7a849a;line-height:2">
+💡 <b style="color:#ff6b35">Tips:</b><br>
+✅ <b style="color:#ddd">Clear audio</b> use karo — background noise se accuracy kam hoti hai<br>
+✅ <b style="color:#ddd">medium model</b> recommend hai — ~30% better accuracy<br>
+⚠️ Medium model pehli baar ~1.4GB download karega<br>
+⚠️ Rare words mein manually adjust kar lena
+</div>
+<div style="text-align:center;padding:.8rem 0;color:#3a4260;font-size:.7rem">
+Powered by Whisper + Custom Hinglish Parser • 100% Free
+</div>
+""", unsafe_allow_html=True)
